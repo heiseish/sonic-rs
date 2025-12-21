@@ -1,3 +1,5 @@
+use std::alloc::Allocator;
+
 use bytes::Bytes;
 use faststr::FastStr;
 
@@ -180,6 +182,22 @@ where
     let reader = Read::new(slice, false);
     let mut parser = Parser::new(reader);
     let (sub, status) = parser.get_from_with_iter_unchecked(path)?;
+    Ok(LazyValue::new(json.from_subset(sub), status.into()))
+}
+
+pub unsafe fn get_unchecked_in<'de, Input, Path: IntoIterator>(
+    json: Input,
+    path: Path,
+    alloc: impl Allocator,
+) -> Result<LazyValue<'de>>
+where
+    Input: JsonInput<'de>,
+    Path::Item: Index,
+{
+    let slice = json.to_u8_slice();
+    let reader = Read::new(slice, false);
+    let mut parser = Parser::new(reader);
+    let (sub, status) = parser.get_from_with_iter_unchecked_in(path, alloc)?;
     Ok(LazyValue::new(json.from_subset(sub), status.into()))
 }
 
@@ -419,7 +437,7 @@ where
 /// The result is a `Result<Vec<Option<LazyValue>>>`. The order of the `Vec` is same as the order of
 /// the tree.
 ///
-/// If a key is unknown, the value at the corresponding position in `Vec` will be None.  
+/// If a key is unknown, the value at the corresponding position in `Vec` will be None.
 /// If json is invalid, or the field not be found, it will return a err.
 ///
 /// # Examples
