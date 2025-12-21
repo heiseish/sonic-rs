@@ -1,4 +1,5 @@
 use std::{
+    alloc::Allocator,
     borrow::Cow,
     collections::HashMap,
     fmt::Debug,
@@ -80,15 +81,15 @@ where
     }
 }
 
-pub(crate) enum ParsedSlice<'b, 'c> {
+pub(crate) enum ParsedSlice<'b, 'c, A: Allocator> {
     Borrowed {
         slice: &'b [u8],
-        buf: &'c mut Vec<u8>,
+        buf: &'c mut Vec<u8, A>,
     },
-    Copied(&'c mut Vec<u8>),
+    Copied(&'c mut Vec<u8, A>),
 }
 
-impl<'b, 'c> Deref for ParsedSlice<'b, 'c> {
+impl<'b, 'c, A: Allocator> Deref for ParsedSlice<'b, 'c, A> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -230,6 +231,31 @@ impl From<ParseStatus> for HasEsc {
     }
 }
 
+fn from_utf8_lossy<A: Allocator>(v: &[u8], alloc: A) -> Vec<u8, A> {
+    let mut iter = v.utf8_chunks();
+    let Some(chunk) = iter.next() else {
+        return Vec::new_in(alloc);
+    };
+    let first_valid = chunk.valid();
+    let mut res_vec = Vec::with_capacity_in(v.len(), alloc);
+    if chunk.invalid().is_empty() {
+        debug_assert_eq!(first_valid.len(), v.len());
+        res_vec.extend_from_slice(first_valid.as_bytes());
+        return res_vec;
+    }
+    const REPLACEMENT: &str = "\u{FFFD}";
+
+    res_vec.extend_from_slice(first_valid.as_bytes());
+    res_vec.extend_from_slice(REPLACEMENT.as_bytes());
+    for chunk in iter {
+        res_vec.extend_from_slice(chunk.valid().as_bytes());
+        if !chunk.invalid().is_empty() {
+            res_vec.extend_from_slice(REPLACEMENT.as_bytes());
+        }
+    }
+    res_vec
+}
+
 impl<'de, R> Parser<R>
 where
     R: Reader<'de>,
@@ -337,7 +363,11 @@ where
     /// When `strbuf` is Some, copies into the buffer (owned, calls visit_str).
     /// When `strbuf` is None, parses inplace zero-copy (calls visit_borrowed_str).
     #[inline(always)]
-    fn parse_string_visit<V>(&mut self, vis: &mut V, strbuf: Option<&mut Vec<u8>>) -> Result<()>
+    fn parse_string_visit<V, A: Allocator + Copy>(
+        &mut self,
+        vis: &mut V,
+        strbuf: Option<&mut Vec<u8, A>>,
+    ) -> Result<()>
     where
         V: JsonVisitor<'de>,
     {
@@ -385,11 +415,11 @@ where
                     return check_visit!(self, vis.visit_borrowed_str(s));
                 }
                 if ch == b'\\' || ch < 0x20 {
-                    return self.parse_string_visit(vis, None);
+                    return self.parse_string_visit::<_, std::alloc::Global>(vis, None);
                 }
                 p = p.add(1);
             }
-            self.parse_string_visit(vis, None)
+            self.parse_string_visit::<_, std::alloc::Global>(vis, None)
         }
     }
 
@@ -425,7 +455,11 @@ where
         }
     }
 
-    fn parse_array<V>(&mut self, vis: &mut V, mut strbuf: Option<&mut Vec<u8>>) -> Result<()>
+    fn parse_array<V, A: Allocator + Copy>(
+        &mut self,
+        vis: &mut V,
+        mut strbuf: Option<&mut Vec<u8, A>>,
+    ) -> Result<()>
     where
         V: JsonVisitor<'de>,
     {
@@ -463,7 +497,11 @@ where
         }
     }
 
-    fn parse_object<V>(&mut self, vis: &mut V, mut strbuf: Option<&mut Vec<u8>>) -> Result<()>
+    fn parse_object<V, A: Allocator + Copy>(
+        &mut self,
+        vis: &mut V,
+        mut strbuf: Option<&mut Vec<u8, A>>,
+    ) -> Result<()>
     where
         V: JsonVisitor<'de>,
     {
@@ -531,11 +569,11 @@ where
     /// When `strbuf` is None, strings are parsed inplace (zero-copy borrowed).
     /// When `strbuf` is Some, strings are parsed into the buffer (owned copy).
     #[inline(always)]
-    fn dispatch_value<V>(
+    fn dispatch_value<V, A: Allocator + Copy>(
         &mut self,
         ch: Option<u8>,
         vis: &mut V,
-        strbuf: &mut Option<&mut Vec<u8>>,
+        strbuf: &mut Option<&mut Vec<u8, A>>,
     ) -> Result<()>
     where
         V: JsonVisitor<'de>,
@@ -757,10 +795,10 @@ where
     }
 
     #[inline(always)]
-    pub(crate) fn parse_dom<V>(
+    pub(crate) fn parse_dom<V, A: Allocator + Copy>(
         &mut self,
         vis: &mut V,
-        mut strbuf: Option<&mut Vec<u8>>,
+        mut strbuf: Option<&mut Vec<u8, A>>,
     ) -> Result<()>
     where
         V: JsonVisitor<'de>,
@@ -772,13 +810,16 @@ where
     }
 
     #[inline(always)]
-    pub fn parse_str<'own>(&mut self, buf: &'own mut Vec<u8>) -> Result<Reference<'de, 'own, str>> {
+
+    pub fn parse_str<'own, A: Allocator + Copy>(
+        &mut self,
+        buf: &'own mut Vec<u8, A>,
+    ) -> Result<Reference<'de, 'own, str>> {
         match self.parse_string_raw(buf) {
             Ok(ParsedSlice::Copied(buf)) => {
                 if self.check_invalid_utf8(self.cfg.utf8_lossy)? {
                     // repr the invalid utf-8
-                    let repr = String::from_utf8_lossy(buf.as_ref()).into_owned();
-                    *buf = repr.into_bytes();
+                    *buf = from_utf8_lossy(buf.as_ref(), *buf.allocator());
                 }
                 let slice = unsafe { from_utf8_unchecked(buf.as_slice()) };
                 Ok(Reference::Copied(slice))
@@ -786,14 +827,14 @@ where
             Ok(ParsedSlice::Borrowed { slice, buf }) => {
                 if self.check_invalid_utf8(self.cfg.utf8_lossy)? {
                     // repr the invalid utf-8
-                    let repr = String::from_utf8_lossy(slice).into_owned();
-                    *buf = repr.into_bytes();
+                    *buf = from_utf8_lossy(slice, *buf.allocator());
                     let slice = unsafe { from_utf8_unchecked(buf) };
                     Ok(Reference::Copied(slice))
                 } else {
                     Ok(Reference::Borrowed(unsafe { from_utf8_unchecked(slice) }))
                 }
             }
+
             Err(e) => Err(e),
         }
     }
@@ -875,7 +916,10 @@ where
         }
     }
 
-    pub(crate) unsafe fn parse_escaped_char(&mut self, buf: &mut Vec<u8>) -> Result<()> {
+    pub(crate) unsafe fn parse_escaped_char<A: Allocator>(
+        &mut self,
+        buf: &mut Vec<u8, A>,
+    ) -> Result<()> {
         'escape: loop {
             match self.read.next() {
                 Some(b'u') => {
@@ -905,10 +949,10 @@ where
         Ok(())
     }
 
-    pub(crate) unsafe fn parse_string_escaped<'own>(
+    pub(crate) unsafe fn parse_string_escaped<'own, A: Allocator>(
         &mut self,
-        buf: &'own mut Vec<u8>,
-    ) -> Result<ParsedSlice<'de, 'own>> {
+        buf: &'own mut Vec<u8, A>,
+    ) -> Result<ParsedSlice<'de, 'own, A>> {
         #[cfg(all(target_feature = "neon", target_arch = "aarch64"))]
         let mut block: StringBlock<NeonBits>;
         #[cfg(not(all(target_feature = "neon", target_arch = "aarch64")))]
@@ -977,10 +1021,10 @@ where
 
     #[inline(always)]
     // parse_string_raw maybe borrowed, maybe copied into buf(buf will be clear at first).
-    pub(crate) fn parse_string_raw<'own>(
+    pub(crate) fn parse_string_raw<'own, A: Allocator>(
         &mut self,
-        buf: &'own mut Vec<u8>,
-    ) -> Result<ParsedSlice<'de, 'own>> {
+        buf: &'own mut Vec<u8, A>,
+    ) -> Result<ParsedSlice<'de, 'own, A>> {
         // now reader is start after `"`, so we can directly skipstring
         let start = self.read.index();
         #[cfg(all(target_feature = "neon", target_arch = "aarch64"))]
@@ -1627,10 +1671,10 @@ where
     // get_from_object will make reader at the position after target key in JSON object.
     // Advance reader past the value of `target_key` in a JSON object.
     // When `checked` is false, uses fast-path token scanning to skip values.
-    fn get_from_object(
+    fn get_from_object<A: Allocator>(
         &mut self,
         target_key: &str,
-        temp_buf: &mut Vec<u8>,
+        temp_buf: &mut Vec<u8, A>,
         checked: bool,
     ) -> Result<()> {
         match self.skip_space() {
@@ -1756,8 +1800,20 @@ where
     where
         P::Item: Index,
     {
+        self.get_from_with_iter_in(path, checked, std::alloc::Global)
+    }
+
+    pub(crate) fn get_from_with_iter_in<P: IntoIterator, A: Allocator>(
+        &mut self,
+        path: P,
+        checked: bool,
+        alloc: A,
+    ) -> Result<(&'de [u8], ParseStatus)>
+    where
+        P::Item: Index,
+    {
         // temp buf reused when parsing each escaped key
-        let mut temp_buf = Vec::with_capacity(DEFAULT_KEY_BUF_CAPACITY);
+        let mut temp_buf = Vec::with_capacity_in(DEFAULT_KEY_BUF_CAPACITY, alloc);
         for jp in path.into_iter() {
             if let Some(key) = jp.as_key() {
                 self.get_from_object(key, &mut temp_buf, checked)

@@ -1,7 +1,13 @@
 //! Deserialize JSON data to a Rust data structure.
 
 // The code is cloned from [serde_json](https://github.com/serde-rs/json) and modified necessary parts.
-use std::{marker::PhantomData, mem::ManuallyDrop, ptr::slice_from_raw_parts, sync::Arc};
+use std::{
+    alloc::Allocator,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ptr::slice_from_raw_parts,
+    sync::Arc,
+};
 
 use serde::{
     de::{self, Expected, Unexpected},
@@ -23,11 +29,12 @@ use crate::{
 const MAX_ALLOWED_DEPTH: u8 = u8::MAX;
 
 //////////////////////////////////////////////////////////////////////////////
+use std::alloc::Global;
 
 /// A structure that deserializes JSON into Rust values.
-pub struct Deserializer<R> {
+pub struct Deserializer<R, A: Allocator = Global> {
     pub(crate) parser: Parser<R>,
-    scratch: Vec<u8>,
+    scratch: Vec<u8, A>,
     remaining_depth: u8,
     shared: Option<Arc<Shared>>, // the shared allocator for `Value`
 }
@@ -39,6 +46,27 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         Self {
             parser: Parser::new(read),
             scratch: Vec::new(),
+            remaining_depth: MAX_ALLOWED_DEPTH,
+            shared: Option::None,
+        }
+    }
+    /// Convert Deserializer to a [`StreamDeserializer`].
+    pub fn into_stream<T>(self) -> StreamDeserializer<'de, T, R> {
+        StreamDeserializer {
+            de: self,
+            data: PhantomData,
+            lifetime: PhantomData,
+            is_ending: false,
+        }
+    }
+}
+
+impl<'de, R: Reader<'de>, A: Allocator + Copy> Deserializer<R, A> {
+    /// Create a new deserializer.
+    pub fn with_capacity_in(read: R, capacity: usize, allocator: A) -> Self {
+        Self {
+            parser: Parser::new(read),
+            scratch: Vec::with_capacity_in(capacity, allocator),
             remaining_depth: MAX_ALLOWED_DEPTH,
             shared: Option::None,
         }
@@ -120,16 +148,6 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         de::Deserialize::deserialize(self)
     }
 
-    /// Convert Deserializer to a [`StreamDeserializer`].
-    pub fn into_stream<T>(self) -> StreamDeserializer<'de, T, R> {
-        StreamDeserializer {
-            de: self,
-            data: PhantomData,
-            lifetime: PhantomData,
-            is_ending: false,
-        }
-    }
-
     /// The `Deserializer::end` method should be called after a value has been fully deserialized.
     /// This allows the `Deserializer` to validate that the input stream is at the end or that it
     /// only has trailing whitespace.
@@ -154,6 +172,16 @@ impl<'de> Deserializer<Read<'de>> {
     /// Create a new deserializer from a string slice.
     pub fn from_slice(s: &'de [u8]) -> Self {
         Self::new(Read::from(s))
+    }
+}
+
+impl<'de, A: Allocator + Copy> Deserializer<Read<'de>, A> {
+    pub fn from_str_with_alloc(s: &'de str, preallocated: Option<usize>, allocator: A) -> Self {
+        Self::with_capacity_in(Read::from(s), preallocated.unwrap_or(s.len()), allocator)
+    }
+
+    pub fn from_slice_with_alloc(s: &'de [u8], preallocated: Option<usize>, allocator: A) -> Self {
+        Self::with_capacity_in(Read::from(s), preallocated.unwrap_or(s.len()), allocator)
     }
 }
 
@@ -222,7 +250,7 @@ macro_rules! tri {
 
 pub(crate) use tri;
 
-impl<'de, R: Reader<'de>> Deserializer<R> {
+impl<'de, R: Reader<'de>, A: Allocator + Copy> Deserializer<R, A> {
     /// Ensures recursion depth limit; calls `f` with `self` and restores depth on return.
     #[inline]
     fn with_depth_limit<F, T>(&mut self, f: F) -> Result<T>
@@ -270,7 +298,7 @@ macro_rules! impl_deserialize_number {
 }
 
 // some functions only used for struct visitors.
-impl<'de, R: Reader<'de>> Deserializer<R> {
+impl<'de, R: Reader<'de>, A: Allocator + Copy> Deserializer<R, A> {
     /// Fix error position for deserialized results.
     #[inline]
     fn fix_position<T>(&self, result: Result<T>) -> Result<T> {
@@ -448,7 +476,9 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
     }
 }
 
-impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> {
+impl<'de, 'a, R: Reader<'de>, A: Allocator + Copy> de::Deserializer<'de>
+    for &'a mut Deserializer<R, A>
+{
     type Error = Error;
     #[inline]
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
@@ -891,18 +921,18 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
     }
 }
 
-pub struct SeqAccess<'a, R: 'a> {
-    de: &'a mut Deserializer<R>,
+pub struct SeqAccess<'a, R: 'a, A: Allocator> {
+    de: &'a mut Deserializer<R, A>,
     first: bool, // first is marked as
 }
 
-impl<'a, R: 'a> SeqAccess<'a, R> {
-    pub fn new(de: &'a mut Deserializer<R>) -> Self {
+impl<'a, R: 'a, A: Allocator> SeqAccess<'a, R, A> {
+    pub fn new(de: &'a mut Deserializer<R, A>) -> Self {
         SeqAccess { de, first: true }
     }
 }
 
-impl<'de, 'a, R: Reader<'de> + 'a> de::SeqAccess<'de> for SeqAccess<'a, R> {
+impl<'de, 'a, R: Reader<'de> + 'a, A: Allocator + Copy> de::SeqAccess<'de> for SeqAccess<'a, R, A> {
     type Error = Error;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
@@ -929,18 +959,18 @@ impl<'de, 'a, R: Reader<'de> + 'a> de::SeqAccess<'de> for SeqAccess<'a, R> {
     }
 }
 
-pub struct MapAccess<'a, R: 'a> {
-    de: &'a mut Deserializer<R>,
+pub struct MapAccess<'a, R: 'a, A: Allocator> {
+    de: &'a mut Deserializer<R, A>,
     first: bool,
 }
 
-impl<'a, R: 'a> MapAccess<'a, R> {
-    pub fn new(de: &'a mut Deserializer<R>) -> Self {
+impl<'a, R: 'a, A: Allocator> MapAccess<'a, R, A> {
+    pub fn new(de: &'a mut Deserializer<R, A>) -> Self {
         MapAccess { de, first: true }
     }
 }
 
-impl<'de, 'a, R: Reader<'de> + 'a> de::MapAccess<'de> for MapAccess<'a, R> {
+impl<'de, 'a, R: Reader<'de> + 'a, A: Allocator + Copy> de::MapAccess<'de> for MapAccess<'a, R, A> {
     type Error = Error;
 
     #[inline(always)]
@@ -1007,17 +1037,19 @@ impl<'de, 'a, R: Reader<'de> + 'a> de::MapAccess<'de> for MapAccess<'a, R> {
     }
 }
 
-struct VariantAccess<'a, R: 'a> {
-    de: &'a mut Deserializer<R>,
+struct VariantAccess<'a, R: 'a, A: Allocator> {
+    de: &'a mut Deserializer<R, A>,
 }
 
-impl<'a, R: 'a> VariantAccess<'a, R> {
-    fn new(de: &'a mut Deserializer<R>) -> Self {
+impl<'a, R: 'a, A: Allocator> VariantAccess<'a, R, A> {
+    fn new(de: &'a mut Deserializer<R, A>) -> Self {
         VariantAccess { de }
     }
 }
 
-impl<'de, 'a, R: Reader<'de> + 'a> de::EnumAccess<'de> for VariantAccess<'a, R> {
+impl<'de, 'a, R: Reader<'de> + 'a, A: Allocator + Copy> de::EnumAccess<'de>
+    for VariantAccess<'a, R, A>
+{
     type Error = Error;
     type Variant = Self;
 
@@ -1031,7 +1063,9 @@ impl<'de, 'a, R: Reader<'de> + 'a> de::EnumAccess<'de> for VariantAccess<'a, R> 
     }
 }
 
-impl<'de, 'a, R: Reader<'de> + 'a> de::VariantAccess<'de> for VariantAccess<'a, R> {
+impl<'de, 'a, R: Reader<'de> + 'a, A: Allocator + Copy> de::VariantAccess<'de>
+    for VariantAccess<'a, R, A>
+{
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
@@ -1060,17 +1094,19 @@ impl<'de, 'a, R: Reader<'de> + 'a> de::VariantAccess<'de> for VariantAccess<'a, 
     }
 }
 
-struct UnitVariantAccess<'a, R: 'a> {
-    de: &'a mut Deserializer<R>,
+struct UnitVariantAccess<'a, R: 'a, A: Allocator> {
+    de: &'a mut Deserializer<R, A>,
 }
 
-impl<'a, R: 'a> UnitVariantAccess<'a, R> {
-    fn new(de: &'a mut Deserializer<R>) -> Self {
+impl<'a, R: 'a, A: Allocator> UnitVariantAccess<'a, R, A> {
+    fn new(de: &'a mut Deserializer<R, A>) -> Self {
         UnitVariantAccess { de }
     }
 }
 
-impl<'de, 'a, R: Reader<'de> + 'a> de::EnumAccess<'de> for UnitVariantAccess<'a, R> {
+impl<'de, 'a, R: Reader<'de> + 'a, A: Allocator + Copy> de::EnumAccess<'de>
+    for UnitVariantAccess<'a, R, A>
+{
     type Error = Error;
     type Variant = Self;
 
@@ -1083,7 +1119,9 @@ impl<'de, 'a, R: Reader<'de> + 'a> de::EnumAccess<'de> for UnitVariantAccess<'a,
     }
 }
 
-impl<'de, 'a, R: Reader<'de> + 'a> de::VariantAccess<'de> for UnitVariantAccess<'a, R> {
+impl<'de, 'a, R: Reader<'de> + 'a, A: Allocator> de::VariantAccess<'de>
+    for UnitVariantAccess<'a, R, A>
+{
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
@@ -1124,8 +1162,8 @@ impl<'de, 'a, R: Reader<'de> + 'a> de::VariantAccess<'de> for UnitVariantAccess<
 /// Only deserialize from this after peeking a '"' byte! Otherwise it may
 /// deserialize invalid JSON successfully./// Only deserialize from this after peeking a '"' byte!
 /// Otherwise it may deserialize invalid JSON successfully.
-struct MapKey<'a, R: 'a> {
-    de: &'a mut Deserializer<R>,
+struct MapKey<'a, R: 'a, A: Allocator> {
+    de: &'a mut Deserializer<R, A>,
 }
 
 macro_rules! deserialize_numeric_key {
@@ -1164,7 +1202,7 @@ macro_rules! deserialize_numeric_key {
     };
 }
 
-impl<'de, 'a, R> de::Deserializer<'de> for MapKey<'a, R>
+impl<'de, 'a, R, A: Allocator + Copy> de::Deserializer<'de> for MapKey<'a, R, A>
 where
     R: Reader<'de>,
 {
