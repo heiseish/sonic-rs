@@ -1,7 +1,6 @@
 #![cfg_attr(not(doctest), doc = include_str!("../README.md"))]
 #![allow(clippy::needless_lifetimes)]
 #![doc(test(attr(warn(unused))))]
-#![feature(allocator_api)]
 
 mod config;
 pub mod error;

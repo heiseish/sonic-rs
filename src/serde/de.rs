@@ -2,11 +2,7 @@
 
 // The code is cloned from [serde_json](https://github.com/serde-rs/json) and modified necessary parts.
 use std::{
-    alloc::Allocator,
-    marker::PhantomData,
-    mem::ManuallyDrop,
-    ptr::slice_from_raw_parts,
-    sync::Arc,
+    alloc::Allocator, marker::PhantomData, mem::ManuallyDrop, ptr::slice_from_raw_parts, sync::Arc,
 };
 
 use serde::{
